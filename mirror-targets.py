@@ -8,7 +8,7 @@ import zipfile
 import json
 import subprocess
 import random
-import yaml
+import re
 from dotenv import load_dotenv
 from backoff import on_exception, expo
 from ratelimit import RateLimitException
@@ -99,24 +99,25 @@ def create_repo(name):
 def install_actions_workflow():
     os.makedirs('.github/workflows', exist_ok=True)
 
-    # Read and parse the template workflow
+    # Read the template workflow as text
     with open('../semgrep.yml', 'r') as f:
-        workflow = yaml.safe_load(f)
+        workflow_content = f.read()
 
     # Add jitter to the cron schedule (randomize minute 0-59 and hour 0-23)
     random_minute = random.randint(0, 59)
     random_hour = random.randint(0, 23)
     jittered_cron = f'{random_minute} {random_hour} * * *'
 
-    # Update the cron schedule with jitter
-    if 'on' in workflow and 'schedule' in workflow['on']:
-        for schedule_item in workflow['on']['schedule']:
-            if 'cron' in schedule_item:
-                schedule_item['cron'] = jittered_cron
+    # Replace the cron schedule using regex to preserve YAML formatting
+    workflow_content = re.sub(
+        r"cron:\s*['\"]?\d+\s+\d+\s+\*\s+\*\s+\*['\"]?",
+        f"cron: '{jittered_cron}'",
+        workflow_content
+    )
 
     # Write the modified workflow
     with open('.github/workflows/semgrep.yml', 'w') as f:
-        yaml.dump(workflow, f, default_flow_style=False, sort_keys=False)
+        f.write(workflow_content)
 
 def mirror_target(type, target):
     print(f'Mirroring {target}...')

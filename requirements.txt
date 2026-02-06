@@ -2,4 +2,3 @@ requests
 backoff
 ratelimit
 python-dotenv
-pyyaml
