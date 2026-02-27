@@ -144,10 +144,24 @@ def mirror_target(type, target):
     # Remove the cloned repo
     shutil.rmtree(repo)
 
+def update_workflow(type, target):
+    print(f'Updating workflow for {target["slug"]}...')
+    repo = f'{type}-{target["slug"]}'
+    os.system(f'git clone https://{GITHUB_USERNAME}:{GH_TOKEN}@github.com/{GITHUB_ORG}/{repo}.git')
+    os.chdir(repo)
+    install_actions_workflow()
+    os.system('git add .github/workflows/semgrep.yml')
+    os.system('git commit -m "Update semgrep workflow" || echo "No changes to commit"')
+    os.system('git push -u origin main')
+    os.chdir('..')
+    shutil.rmtree(repo)
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--min_install_count', type=int,
                         default=int(os.environ.get('MIN_INSTALL_COUNT', 1000)))
+    parser.add_argument('--update-workflows', action='store_true',
+                        help='Force-install the latest semgrep.yml in all tracked repos')
     args = parser.parse_args()
 
     # Set identity for git
@@ -177,13 +191,23 @@ if __name__ == '__main__':
             new_targets['themes'][theme['slug']] = theme
 
     # Find plugins or themes that are new or have been updated
+    mirrored = set()
+
     for type in ['plugins', 'themes']:
         for slug, target in new_targets[type].items():
-            if not slug in old_targets[type]:
+            if slug not in old_targets[type]:
                 create_repo(f'{GITHUB_ORG}/{type}-{slug}')
                 mirror_target(type, target)
+                mirrored.add((type, slug))
             elif target['version'] != old_targets[type][slug]['version']:
                 mirror_target(type, target)
+                mirrored.add((type, slug))
+
+    if args.update_workflows:
+        for type in ['plugins', 'themes']:
+            for slug, target in old_targets[type].items():
+                if (type, slug) not in mirrored:
+                    update_workflow(type, target)
 
     # Save the new metadata to targets.json
     with open('targets.json', 'w') as f:

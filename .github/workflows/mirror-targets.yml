@@ -1,7 +1,12 @@
 name: Mirror WordPress Plugins & Themes
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      update_workflows:
+        description: 'Force-install the latest semgrep.yml in all tracked repos'
+        type: boolean
+        default: false
   schedule:
   - cron: '11 * * * *'
 
@@ -19,6 +24,6 @@ jobs:
         python-version: '3.10'
         cache: 'pip'
     - run: pip install -r requirements.txt
-    - run: python mirror-targets.py
+    - run: python mirror-targets.py ${{ inputs.update_workflows == true && '--update-workflows' || '' }}
       env:
         GH_TOKEN: ${{ secrets.WORDPRESS_BUG_BOUNTY_GITHUB_TOKEN }}
