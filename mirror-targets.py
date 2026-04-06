@@ -130,30 +130,30 @@ def unarchive_repo(repo):
 
 
 def clone_repo(repo):
-    """Clone a repo, unarchiving first if necessary. Returns the clone dir."""
+    """Clone a repo, unarchiving first if necessary."""
     url = f'https://{GITHUB_USERNAME}:{GH_TOKEN}@github.com/{GITHUB_ORG}/{repo}.git'
-    try:
-        subprocess.run(['git', 'clone', url], check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        if '403' in (e.stderr or '') or 'archived' in (e.stderr or '').lower():
-            unarchive_repo(repo)
-            subprocess.run(['git', 'clone', url], check=True, capture_output=True, text=True)
-        else:
-            raise
+    subprocess.run(['git', 'clone', url], check=True, capture_output=True, text=True)
+
+
+def is_repo_archived(repo):
+    """Check if a repo is archived via the GitHub API."""
+    result = subprocess.run(
+        ['gh', 'api', f'repos/{GITHUB_ORG}/{repo}', '--jq', '.archived'],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() == 'true'
 
 
 def push_repo(repo):
-    """Push to origin, unarchiving the repo first if the push is rejected."""
+    """Push to origin, unarchiving the repo first if necessary."""
+    if is_repo_archived(repo):
+        unarchive_repo(repo)
     try:
         subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True,
                        capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
-        if e.returncode == 128 and ('403' in (e.stderr or '') or 'archived' in (e.stderr or '').lower()):
-            unarchive_repo(repo)
-            subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True,
-                           capture_output=True, text=True)
-        else:
-            raise
+        print(f'  git push stderr: {e.stderr}')
+        raise
 
 
 def mirror_target(type, target):
