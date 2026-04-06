@@ -142,6 +142,20 @@ def clone_repo(repo):
             raise
 
 
+def push_repo(repo):
+    """Push to origin, unarchiving the repo first if the push is rejected."""
+    try:
+        subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True,
+                       capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        if e.returncode == 128 and ('403' in (e.stderr or '') or 'archived' in (e.stderr or '').lower()):
+            unarchive_repo(repo)
+            subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True,
+                           capture_output=True, text=True)
+        else:
+            raise
+
+
 def mirror_target(type, target):
     """Mirror a plugin/theme. Returns True on success, False on failure."""
     print(f'Mirroring {target}...')
@@ -158,8 +172,7 @@ def mirror_target(type, target):
         subprocess.run(['git', 'add', '.'], check=True)
         # commit returns 1 when there's nothing to commit — that's fine
         subprocess.run(['git', 'commit', '-m', target['version']], capture_output=True)
-        subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True,
-                       capture_output=True, text=True)
+        push_repo(repo)
         return True
     except Exception as e:
         print(f'ERROR mirroring {repo}: {e}')
@@ -181,8 +194,7 @@ def update_workflow(type, target):
         install_actions_workflow()
         subprocess.run(['git', 'add', '.github/workflows/semgrep.yml'], check=True)
         subprocess.run(['git', 'commit', '-m', 'Update semgrep workflow'], capture_output=True)
-        subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True,
-                       capture_output=True, text=True)
+        push_repo(repo)
         return True
     except Exception as e:
         print(f'ERROR updating workflow for {repo}: {e}')
