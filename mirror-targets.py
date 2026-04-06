@@ -119,42 +119,78 @@ def install_actions_workflow():
     with open('.github/workflows/semgrep.yml', 'w') as f:
         f.write(workflow_content)
 
+def unarchive_repo(repo):
+    """Unarchive a GitHub repo so we can push to it."""
+    print(f'Unarchiving {GITHUB_ORG}/{repo}...')
+    subprocess.run(
+        ['gh', 'api', '-X', 'PATCH', f'repos/{GITHUB_ORG}/{repo}',
+         '-f', 'archived=false'],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def clone_repo(repo):
+    """Clone a repo, unarchiving first if necessary. Returns the clone dir."""
+    url = f'https://{GITHUB_USERNAME}:{GH_TOKEN}@github.com/{GITHUB_ORG}/{repo}.git'
+    try:
+        subprocess.run(['git', 'clone', url], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        if '403' in (e.stderr or '') or 'archived' in (e.stderr or '').lower():
+            unarchive_repo(repo)
+            subprocess.run(['git', 'clone', url], check=True, capture_output=True, text=True)
+        else:
+            raise
+
+
 def mirror_target(type, target):
+    """Mirror a plugin/theme. Returns True on success, False on failure."""
     print(f'Mirroring {target}...')
-
-    # Clone the repo
     repo = f'{type}-{target["slug"]}'
-    os.system(f'git clone https://{GITHUB_USERNAME}:{GH_TOKEN}@github.com/{GITHUB_ORG}/{repo}.git')
-    os.chdir(repo)
+    orig_dir = os.getcwd()
 
-    # Download the latest version of the plugin or theme
-    download_file(target['download_link'], f'{target["slug"]}.{target["version"]}.zip')
+    try:
+        clone_repo(repo)
+        os.chdir(repo)
 
-    # Install the actions workflow
-    install_actions_workflow()
+        download_file(target['download_link'], f'{target["slug"]}.{target["version"]}.zip')
+        install_actions_workflow()
 
-    # Commit the updated files to the repo
-    os.system('git add .')
-    os.system(f'git commit -m "{target["version"]}" || echo "No changes to commit"')
-    os.system('git push -u origin main')
-
-    # Change back to the original directory
-    os.chdir('..')
-
-    # Remove the cloned repo
-    shutil.rmtree(repo)
+        subprocess.run(['git', 'add', '.'], check=True)
+        # commit returns 1 when there's nothing to commit — that's fine
+        subprocess.run(['git', 'commit', '-m', target['version']], capture_output=True)
+        subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True,
+                       capture_output=True, text=True)
+        return True
+    except Exception as e:
+        print(f'ERROR mirroring {repo}: {e}')
+        return False
+    finally:
+        os.chdir(orig_dir)
+        if os.path.isdir(repo):
+            shutil.rmtree(repo)
 
 def update_workflow(type, target):
+    """Update the semgrep workflow in a repo. Returns True on success, False on failure."""
     print(f'Updating workflow for {target["slug"]}...')
     repo = f'{type}-{target["slug"]}'
-    os.system(f'git clone https://{GITHUB_USERNAME}:{GH_TOKEN}@github.com/{GITHUB_ORG}/{repo}.git')
-    os.chdir(repo)
-    install_actions_workflow()
-    os.system('git add .github/workflows/semgrep.yml')
-    os.system('git commit -m "Update semgrep workflow" || echo "No changes to commit"')
-    os.system('git push -u origin main')
-    os.chdir('..')
-    shutil.rmtree(repo)
+    orig_dir = os.getcwd()
+
+    try:
+        clone_repo(repo)
+        os.chdir(repo)
+        install_actions_workflow()
+        subprocess.run(['git', 'add', '.github/workflows/semgrep.yml'], check=True)
+        subprocess.run(['git', 'commit', '-m', 'Update semgrep workflow'], capture_output=True)
+        subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True,
+                       capture_output=True, text=True)
+        return True
+    except Exception as e:
+        print(f'ERROR updating workflow for {repo}: {e}')
+        return False
+    finally:
+        os.chdir(orig_dir)
+        if os.path.isdir(repo):
+            shutil.rmtree(repo)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -165,8 +201,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # Set identity for git
-    os.system(f'git config --global user.name "{GIT_USER_NAME}"')
-    os.system(f'git config --global user.email "{GIT_USER_EMAIL}"')
+    subprocess.run(['git', 'config', '--global', 'user.name', GIT_USER_NAME], check=True)
+    subprocess.run(['git', 'config', '--global', 'user.email', GIT_USER_EMAIL], check=True)
 
     # Read metadata from last run from targets.json
     old_targets = {
@@ -192,16 +228,21 @@ if __name__ == '__main__':
 
     # Find plugins or themes that are new or have been updated
     mirrored = set()
+    failed = set()
 
     for type in ['plugins', 'themes']:
         for slug, target in new_targets[type].items():
             if slug not in old_targets[type]:
                 create_repo(f'{GITHUB_ORG}/{type}-{slug}')
-                mirror_target(type, target)
-                mirrored.add((type, slug))
+                if mirror_target(type, target):
+                    mirrored.add((type, slug))
+                else:
+                    failed.add((type, slug))
             elif target['version'] != old_targets[type][slug]['version']:
-                mirror_target(type, target)
-                mirrored.add((type, slug))
+                if mirror_target(type, target):
+                    mirrored.add((type, slug))
+                else:
+                    failed.add((type, slug))
 
     if args.update_workflows:
         for type in ['plugins', 'themes']:
@@ -209,11 +250,25 @@ if __name__ == '__main__':
                 if (type, slug) not in mirrored:
                     update_workflow(type, target)
 
+    # For failed mirrors, preserve the old version in targets.json so they
+    # get retried on the next run instead of being silently skipped.
+    for type, slug in failed:
+        if slug in old_targets[type]:
+            new_targets[type][slug] = old_targets[type][slug]
+        else:
+            # New target that failed — remove so it gets retried as "new"
+            new_targets[type].pop(slug, None)
+
+    if failed:
+        print(f'\nWARNING: {len(failed)} target(s) failed to mirror and will be retried next run:')
+        for type, slug in sorted(failed):
+            print(f'  - {type}/{slug}')
+
     # Save the new metadata to targets.json
     with open('targets.json', 'w') as f:
         json.dump(new_targets, f)
 
     # Commit and push the updated targets.json
-    os.system('git add targets.json')
-    os.system('git commit -m "Update targets.json" || echo "No changes to commit"')
-    os.system('git push')
+    subprocess.run(['git', 'add', 'targets.json'], check=True)
+    subprocess.run(['git', 'commit', '-m', 'Update targets.json'], capture_output=True)
+    subprocess.run(['git', 'push'], check=True)
