@@ -229,42 +229,81 @@ def update_workflow(type, target):
         if os.path.isdir(repo):
             shutil.rmtree(repo)
 
-def get_repo_version(repo):
-    """Get the mirrored version from the latest version-commit in a GitHub repo.
-    Skips non-version commits like 'Update semgrep workflow' or 'Initial commit'.
-    Returns None if the repo doesn't exist or has no version commits."""
+def get_repo_versions_bulk(repos):
+    """Get the latest version-commit for multiple repos in one GraphQL query.
+    Returns a dict of {repo_name: version_string} for repos that have version commits.
+    Repos that don't exist or have no version commits are omitted."""
     skip = {'Update semgrep workflow', 'Initial commit', 'initial commit'}
-    try:
+    versions = {}
+    batch_size = 100  # GraphQL has a node limit; 100 repos × ~10 fields is safe
+
+    for i in range(0, len(repos), batch_size):
+        batch = repos[i:i + batch_size]
+        # Build a GraphQL query that fetches the last 5 commits for each repo
+        parts = []
+        for idx, repo in enumerate(batch):
+            alias = f'r{idx}'
+            parts.append(f'{alias}: repository(owner: "{GITHUB_ORG}", name: "{repo}") {{'
+                         f'  defaultBranchRef {{ target {{ ... on Commit {{'
+                         f'    history(first: 5) {{ nodes {{ message }} }}'
+                         f'  }} }} }}'
+                         f'}}')
+        query = '{ ' + '\n'.join(parts) + ' }'
+
         result = subprocess.run(
-            ['gh', 'api', f'repos/{GITHUB_ORG}/{repo}/commits?per_page=10',
-             '--jq', '.[].commit.message'],
-            capture_output=True, text=True, check=True,
+            ['gh', 'api', 'graphql', '-f', f'query={query}'],
+            capture_output=True, text=True,
         )
-        for line in result.stdout.strip().split('\n'):
-            msg = line.strip()
-            if msg and msg not in skip:
-                return msg
-        return None
-    except subprocess.CalledProcessError:
-        return None
+        # gh exits non-zero on partial GraphQL errors (e.g. repo not found),
+        # but the response still contains valid data for repos that exist.
+        try:
+            data = json.loads(result.stdout).get('data', {})
+        except (json.JSONDecodeError, AttributeError):
+            print(f'  GraphQL batch {i//batch_size + 1}: invalid response')
+            continue
+
+        for idx, repo in enumerate(batch):
+            alias = f'r{idx}'
+            repo_data = data.get(alias)
+            if not repo_data:
+                continue
+            try:
+                nodes = repo_data['defaultBranchRef']['target']['history']['nodes']
+            except (TypeError, KeyError):
+                continue
+            for node in nodes:
+                msg = node['message'].strip()
+                if msg and msg not in skip:
+                    versions[repo] = msg
+                    break
+
+    return versions
 
 
 def reconcile_targets(targets):
     """Find targets where targets.json version doesn't match the repo's latest commit.
     Returns a list of (type, slug) tuples that need re-mirroring."""
-    stale = []
+    # Build list of all repos to check
+    repo_to_target = {}
     for type in ['plugins', 'themes']:
         for slug, target in targets[type].items():
             repo = f'{type}-{slug}'
-            repo_version = get_repo_version(repo)
-            if repo_version is None:
-                print(f'  {repo}: repo not found or empty — skipping')
-                continue
-            if repo_version != target['version']:
-                print(f'  {repo}: targets.json={target["version"]}  repo={repo_version}  → STALE')
-                stale.append((type, slug))
-            else:
-                print(f'  {repo}: OK ({target["version"]})')
+            repo_to_target[repo] = (type, slug, target)
+
+    print(f'  Checking {len(repo_to_target)} repos via GraphQL...')
+    versions = get_repo_versions_bulk(list(repo_to_target.keys()))
+
+    stale = []
+    for repo, (type, slug, target) in repo_to_target.items():
+        repo_version = versions.get(repo)
+        if repo_version is None:
+            print(f'  {repo}: repo not found or empty — skipping')
+            continue
+        if repo_version != target['version']:
+            print(f'  {repo}: targets.json={target["version"]}  repo={repo_version}  → STALE')
+            stale.append((type, slug))
+        else:
+            print(f'  {repo}: OK ({target["version"]})')
     return stale
 
 
