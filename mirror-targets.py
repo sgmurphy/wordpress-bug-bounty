@@ -192,12 +192,53 @@ def update_workflow(type, target):
         if os.path.isdir(repo):
             shutil.rmtree(repo)
 
+def get_repo_version(repo):
+    """Get the mirrored version from the latest version-commit in a GitHub repo.
+    Skips non-version commits like 'Update semgrep workflow' or 'Initial commit'.
+    Returns None if the repo doesn't exist or has no version commits."""
+    skip = {'Update semgrep workflow', 'Initial commit', 'initial commit'}
+    try:
+        result = subprocess.run(
+            ['gh', 'api', f'repos/{GITHUB_ORG}/{repo}/commits?per_page=10',
+             '--jq', '.[].commit.message'],
+            capture_output=True, text=True, check=True,
+        )
+        for line in result.stdout.strip().split('\n'):
+            msg = line.strip()
+            if msg and msg not in skip:
+                return msg
+        return None
+    except subprocess.CalledProcessError:
+        return None
+
+
+def reconcile_targets(targets):
+    """Find targets where targets.json version doesn't match the repo's latest commit.
+    Returns a list of (type, slug) tuples that need re-mirroring."""
+    stale = []
+    for type in ['plugins', 'themes']:
+        for slug, target in targets[type].items():
+            repo = f'{type}-{slug}'
+            repo_version = get_repo_version(repo)
+            if repo_version is None:
+                print(f'  {repo}: repo not found or empty — skipping')
+                continue
+            if repo_version != target['version']:
+                print(f'  {repo}: targets.json={target["version"]}  repo={repo_version}  → STALE')
+                stale.append((type, slug))
+            else:
+                print(f'  {repo}: OK ({target["version"]})')
+    return stale
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--min_install_count', type=int,
                         default=int(os.environ.get('MIN_INSTALL_COUNT', 1000)))
     parser.add_argument('--update-workflows', action='store_true',
                         help='Force-install the latest semgrep.yml in all tracked repos')
+    parser.add_argument('--reconcile', action='store_true',
+                        help='Check all targets for version drift and re-mirror stale repos')
     args = parser.parse_args()
 
     # Set identity for git
@@ -225,6 +266,21 @@ if __name__ == '__main__':
     for theme in get_themes():
         if theme['active_installs'] >= args.min_install_count:
             new_targets['themes'][theme['slug']] = theme
+
+    # Reconcile: find repos where targets.json is ahead of the actual repo
+    if args.reconcile:
+        print('\nReconciling targets.json against actual repo versions...')
+        stale = reconcile_targets(old_targets)
+        if stale:
+            print(f'\nFound {len(stale)} stale target(s). Re-mirroring...')
+            for type, slug in stale:
+                target = old_targets[type][slug]
+                if mirror_target(type, target):
+                    print(f'  ✓ {type}/{slug} re-mirrored to {target["version"]}')
+                else:
+                    print(f'  ✗ {type}/{slug} failed to re-mirror')
+        else:
+            print('\nAll targets are in sync.')
 
     # Find plugins or themes that are new or have been updated
     mirrored = set()
