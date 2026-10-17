@@ -163,19 +163,34 @@ def bypass_push_protection(repo, stderr):
     return True
 
 
-def push_repo(repo):
-    """Push to origin, unarchiving or bypassing push protection as needed."""
+def tag_version(version):
+    """Tag HEAD with the version. Returns the tag name, or None if it wasn't created."""
+    exists = subprocess.run(['git', 'rev-parse', '-q', '--verify', f'refs/tags/{version}'],
+                            capture_output=True)
+    if exists.returncode == 0:
+        print(f'  Tag {version} already exists, skipping')
+        return None
+    result = subprocess.run(['git', 'tag', version], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f'  Could not create tag {version}: {result.stderr.strip()}')
+        return None
+    return version
+
+
+def push_repo(repo, tag=None):
+    """Push main (and the version tag, if any) to origin, unarchiving or bypassing
+    push protection as needed."""
     if is_repo_archived(repo):
         unarchive_repo(repo)
+    refs = ['main'] + ([f'refs/tags/{tag}'] if tag else [])
+    push = ['git', 'push', '-u', 'origin', *refs]
     try:
-        subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True,
-                       capture_output=True, text=True)
+        subprocess.run(push, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
         stderr = e.stderr or ''
         if 'PUSH PROTECTION' in stderr and bypass_push_protection(repo, stderr):
             print(f'  Bypassed push protection for {repo}, retrying...')
-            subprocess.run(['git', 'push', '-u', 'origin', 'main'], check=True,
-                           capture_output=True, text=True)
+            subprocess.run(push, check=True, capture_output=True, text=True)
         else:
             print(f'  git push stderr: {stderr}')
             raise
@@ -197,7 +212,7 @@ def mirror_target(type, target):
         subprocess.run(['git', 'add', '.'], check=True)
         # commit returns 1 when there's nothing to commit — that's fine
         subprocess.run(['git', 'commit', '-m', target['version']], capture_output=True)
-        push_repo(repo)
+        push_repo(repo, tag=tag_version(target['version']))
         return True
     except Exception as e:
         print(f'ERROR mirroring {repo}: {e}')
