@@ -1,6 +1,7 @@
 #! /usr/bin/env python3
 
 import argparse
+import io
 import requests
 import os
 import shutil
@@ -72,19 +73,25 @@ def get_themes(page=1):
 
     return themes + get_themes(page + 1) if page < data['info']['pages'] else themes
 
-def download_file(url, filepath):
+def clear_working_tree():
+    """Remove everything but the mirror's own files, so files dropped upstream
+    don't linger in the mirror."""
+    for entry in os.listdir('.'):
+        if entry in ('.git', '.github', 'README.md'):
+            continue
+        if os.path.isdir(entry) and not os.path.islink(entry):
+            shutil.rmtree(entry)
+        else:
+            os.remove(entry)
+
+def download_and_extract(url):
     print(f'Downloading {url}...')
     response = requests.get(url, allow_redirects=True)
-    if response.status_code == 200:
-        with open(filepath, 'wb') as f:
-            f.write(response.content)
-
-        try:
-            with zipfile.ZipFile(filepath, 'r') as zip:
-                zip.extractall()
-                os.remove(filepath)
-        except:
-            print(f'Could not extract zip {filepath}')
+    response.raise_for_status()
+    # Open the zip before clearing so a bad download can't wipe the repo
+    with zipfile.ZipFile(io.BytesIO(response.content)) as zip:
+        clear_working_tree()
+        zip.extractall()
 
 def create_repo(name):
     try:
@@ -99,24 +106,29 @@ def create_repo(name):
 def install_actions_workflow():
     os.makedirs('.github/workflows', exist_ok=True)
 
+    workflow_path = '.github/workflows/semgrep.yml'
+    cron_pattern = r"cron:\s*['\"]?\d+\s+\d+\s+\*\s+\*\s+\*['\"]?"
+
     # Read the template workflow as text
     with open('../semgrep.yml', 'r') as f:
         workflow_content = f.read()
 
-    # Add jitter to the cron schedule (randomize minute 0-59 and hour 0-23)
-    random_minute = random.randint(0, 59)
-    random_hour = random.randint(0, 23)
-    jittered_cron = f'{random_minute} {random_hour} * * *'
+    # Keep the repo's existing schedule so re-mirroring doesn't churn the file;
+    # otherwise add jitter (randomize minute 0-59 and hour 0-23)
+    existing = None
+    if os.path.exists(workflow_path):
+        with open(workflow_path, 'r') as f:
+            existing = re.search(cron_pattern, f.read())
+    if existing:
+        cron = existing.group(0)
+    else:
+        cron = f"cron: '{random.randint(0, 59)} {random.randint(0, 23)} * * *'"
 
     # Replace the cron schedule using regex to preserve YAML formatting
-    workflow_content = re.sub(
-        r"cron:\s*['\"]?\d+\s+\d+\s+\*\s+\*\s+\*['\"]?",
-        f"cron: '{jittered_cron}'",
-        workflow_content
-    )
+    workflow_content = re.sub(cron_pattern, cron, workflow_content)
 
     # Write the modified workflow
-    with open('.github/workflows/semgrep.yml', 'w') as f:
+    with open(workflow_path, 'w') as f:
         f.write(workflow_content)
 
 def unarchive_repo(repo):
@@ -163,14 +175,15 @@ def bypass_push_protection(repo, stderr):
     return True
 
 
-def tag_version(version):
-    """Tag HEAD with the version. Returns the tag name, or None if it wasn't created."""
+def tag_version(version, retag=False):
+    """Tag HEAD with the version, moving an existing tag only when retag is set.
+    Returns the tag name, or None if it wasn't created."""
     exists = subprocess.run(['git', 'rev-parse', '-q', '--verify', f'refs/tags/{version}'],
                             capture_output=True)
-    if exists.returncode == 0:
+    if exists.returncode == 0 and not retag:
         print(f'  Tag {version} already exists, skipping')
         return None
-    result = subprocess.run(['git', 'tag', version], capture_output=True, text=True)
+    result = subprocess.run(['git', 'tag', '-f', version], capture_output=True, text=True)
     if result.returncode != 0:
         print(f'  Could not create tag {version}: {result.stderr.strip()}')
         return None
@@ -182,7 +195,8 @@ def push_repo(repo, tag=None):
     push protection as needed."""
     if is_repo_archived(repo):
         unarchive_repo(repo)
-    refs = ['main'] + ([f'refs/tags/{tag}'] if tag else [])
+    # Force the tag so a retagged version replaces the remote one
+    refs = ['main'] + ([f'+refs/tags/{tag}'] if tag else [])
     push = ['git', 'push', '-u', 'origin', *refs]
     try:
         subprocess.run(push, check=True, capture_output=True, text=True)
@@ -196,7 +210,7 @@ def push_repo(repo, tag=None):
             raise
 
 
-def mirror_target(type, target):
+def mirror_target(type, target, retag=False):
     """Mirror a plugin/theme. Returns True on success, False on failure."""
     print(f'Mirroring {target}...')
     repo = f'{type}-{target["slug"]}'
@@ -206,13 +220,13 @@ def mirror_target(type, target):
         clone_repo(repo)
         os.chdir(repo)
 
-        download_file(target['download_link'], f'{target["slug"]}.{target["version"]}.zip')
+        download_and_extract(target['download_link'])
         install_actions_workflow()
 
         subprocess.run(['git', 'add', '.'], check=True)
         # commit returns 1 when there's nothing to commit — that's fine
         subprocess.run(['git', 'commit', '-m', target['version']], capture_output=True)
-        push_repo(repo, tag=tag_version(target['version']))
+        push_repo(repo, tag=tag_version(target['version'], retag))
         return True
     except Exception as e:
         print(f'ERROR mirroring {repo}: {e}')
@@ -322,6 +336,22 @@ def reconcile_targets(targets):
     return stale
 
 
+def resync_targets(targets, shard, total):
+    """Re-mirror one shard of all targets at their recorded versions, so each
+    repo and version tag matches its release exactly. Returns the failures."""
+    keys = sorted((type, slug) for type in ['plugins', 'themes'] for slug in targets[type])
+    keys = keys[shard::total]
+    print(f'Resyncing shard {shard} of {total} ({len(keys)} targets)...')
+
+    failed = [(type, slug) for type, slug in keys
+              if not mirror_target(type, targets[type][slug], retag=True)]
+    if failed:
+        print(f'\nWARNING: {len(failed)} target(s) failed to resync:')
+        for type, slug in failed:
+            print(f'  - {type}/{slug}')
+    return failed
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--min_install_count', type=int,
@@ -330,6 +360,9 @@ if __name__ == '__main__':
                         help='Force-install the latest semgrep.yml in all tracked repos')
     parser.add_argument('--reconcile', action='store_true',
                         help='Check all targets for version drift and re-mirror stale repos')
+    parser.add_argument('--resync', metavar='SHARD/TOTAL',
+                        help='Re-mirror a shard (0-indexed) of all tracked targets at their '
+                             'current versions, then exit without updating targets.json')
     args = parser.parse_args()
 
     # Set identity for git
@@ -344,6 +377,12 @@ if __name__ == '__main__':
     if os.path.exists('targets.json'):
         with open('targets.json', 'r') as f:
             old_targets = json.load(f)
+
+    if args.resync:
+        shard, total = (int(n) for n in args.resync.split('/'))
+        failed = resync_targets(old_targets, shard, total)
+        # Fail the job so a partial shard is visible and can be rerun
+        raise SystemExit(1 if failed else 0)
 
     # Get a list of in-scope plugins and themes
     new_targets = {
